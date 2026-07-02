@@ -1,19 +1,15 @@
 # countdown.py
+"""
+Ported from v1's CountdownManager. Behavior is unchanged -- still
+polls every tick rather than trusting a locally-computed unlock_time
+-- but it now reads through lock_engine.get_remaining_time() instead
+of a bespoke get_remaining_time_safe() tuple, since that's the new
+core's API shape (RemainingTimeResult, not a tuple).
+"""
 import customtkinter as ctk
 
 
 class CountdownManager:
-    """
-    FIX (مشکل ۲ و ۴): این نسخه دیگه unlock_time رو جدا نگه نمی‌داره و
-    خودش با time.time() محاسبه نمی‌کنه. به‌جاش هر tick مستقیم از
-    core.get_remaining_time_safe() می‌پرسه که چقدر زمان مونده.
-
-    این یعنی:
-    - اگه ساعت سیستم دستکاری بشه، core خودش تشخیص می‌ده (مقاوم‌سازی مشکل ۲)
-    - اگه برنامه بسته و دوباره باز بشه، کافیه countdown دوباره start بشه؛
-      چون منبع حقیقت (lock.json) روی دیسکه، نه متغیر حافظه (مشکل ۴)
-    """
-
     def __init__(self, gui_app):
         self.gui = gui_app
         self.count_label = None
@@ -53,19 +49,19 @@ class CountdownManager:
         if not self.is_running:
             return
 
-        remaining, tampered = self.gui.core.get_remaining_time_safe()
+        result = self.gui.app.lock_engine.get_remaining_time()
 
         if self.tamper_label is not None:
-            if tampered:
+            if result.tampered:
                 self.tamper_label.configure(text="⚠ System clock tampering detected")
             else:
                 self.tamper_label.configure(text="")
 
-        if remaining <= 0:
+        if result.remaining_seconds <= 0:
             self.finish()
             return
 
-        mins, secs = divmod(int(remaining), 60)
+        mins, secs = divmod(int(result.remaining_seconds), 60)
         if self.count_label is not None:
             self.count_label.configure(text=f"{mins:02d}:{secs:02d}")
 
@@ -80,12 +76,6 @@ class CountdownManager:
             self.on_finish()
 
     def stop(self):
-        """
-        متوقف کردن شمارش بدون صدا زدن on_finish. برای وقتی استفاده می‌شه
-        که رمز از مسیر دیگه‌ای (مثل Force Recovery) به‌دست اومده و دیگه
-        نیازی به نمایش صفحه‌ی «Time is Up» نیست.
-        امن است حتی اگه شمارش در حال اجرا نباشه.
-        """
         self.is_running = False
         if self.count_job:
             self.gui.after_cancel(self.count_job)
