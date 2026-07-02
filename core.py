@@ -105,31 +105,70 @@ class TimeLockCore:
     # still better than nothing, and the user is warned at startup that
     # keyring is missing anyway.
 
+    def _sign_history(self, master_key, raw_json_str):
+        return hmac.new(master_key, raw_json_str.encode(), hashlib.sha256).hexdigest()
+
     def get_recovery_history(self):
-        """Returns list of {'ts': float} records, oldest first."""
+        """
+        FIX (item 4): the history is now HMAC-signed with master_key, the
+        same pattern used for lock.json's state_hmac. Returns
+        (history_list, tampered_bool).
+
+        Design intent (matches the stated goal -- make cheating not worth
+        the effort): if the stored history is missing its signature or the
+        signature doesn't match, we do NOT fall back to an empty history.
+        An attacker who deletes/edits the history to erase their past
+        early-unlocks must never end up in a *better* position than if
+        they'd left it alone. The caller (get_recovery_cooldown_status)
+        treats tampered=True as "assume the worst" -- max cooldown, max
+        required acknowledgments -- rather than "assume clean".
+        """
         raw = self._keyring_get("recovery_history")
+        sig = self._keyring_get("recovery_history_hmac")
         if raw is None:
             state = self.load_state()
             raw = state.get("recovery_history_fallback")
+            sig = state.get("recovery_history_fallback_hmac")
+
         if not raw:
-            return []
+            return [], False
+
+        master_key = self.load_master_key()
+        expected_sig = self._sign_history(master_key, raw)
+        if sig is None or not hmac.compare_digest(sig, expected_sig):
+            return [], True
+
         try:
-            return json.loads(raw) if isinstance(raw, str) else raw
+            return json.loads(raw), False
         except (json.JSONDecodeError, TypeError):
-            return []
+            return [], True
 
     def _save_recovery_history(self, history):
-        raw = json.dumps(history)
+        raw = json.dumps(history, sort_keys=True)
+        master_key = self.load_master_key()
+        sig = self._sign_history(master_key, raw)
         if KEYRING_AVAILABLE:
             self._keyring_set("recovery_history", raw)
+            self._keyring_set("recovery_history_hmac", sig)
         else:
             state = self.load_state()
             state["recovery_history_fallback"] = raw
+            state["recovery_history_fallback_hmac"] = sig
             self.save_state(state)
 
     def record_recovery_use(self):
-        """Call this exactly once, right after a Force Recovery succeeds."""
-        history = self.get_recovery_history()
+        """
+        Call this exactly once, right after a Force Recovery succeeds.
+        If the previous history was found tampered, we deliberately don't
+        try to preserve/merge it (it can't be trusted) -- we start a
+        fresh, properly signed history containing just this new entry.
+        Any friction lost from the wiped tampered history was already
+        paid for by get_recovery_cooldown_status forcing the worst case
+        on this attempt.
+        """
+        history, tampered = self.get_recovery_history()
+        if tampered:
+            history = []
         history.append({"ts": time.time()})
         self._save_recovery_history(history)
 
@@ -142,7 +181,13 @@ class TimeLockCore:
         used before, and drives how many times the acknowledgment phrase
         must be retyped correctly before the key-entry form unlocks.
         """
-        history = self.get_recovery_history()
+        history, tampered = self.get_recovery_history()
+
+        if tampered:
+            # FIX (item 4): tampering must never make this easier. Force
+            # the worst case instead of resetting to "no history".
+            return RECOVERY_COOLDOWN_CAP_SECONDS, 5, []
+
         count = len(history)
         if count == 0:
             return 0.0, 1, history
@@ -222,13 +267,39 @@ class TimeLockCore:
 
     def create_new_recovery_key(self):
         key = AESGCM.generate_key(bit_length=256)
-        with open(self.RECOVERY_KEY_FILE, "wb") as f:
-            f.write(key)
-        os.chmod(self.RECOVERY_KEY_FILE, 0o600)
+        if KEYRING_AVAILABLE:
+            self._keyring_set("recovery_key", key.hex())
+        else:
+            with open(self.RECOVERY_KEY_FILE, "wb") as f:
+                f.write(key)
+            os.chmod(self.RECOVERY_KEY_FILE, 0o600)
         self._keyring_set("recovery_key_hash", hashlib.sha256(key).hexdigest())
         return key
 
     def get_recovery_key(self):
+        """
+        FIX (item 3): applies the same pattern used for the master key --
+        the recovery key itself (not just its hash) now lives in the OS
+        credential store when keyring is available, instead of a plaintext
+        file that a simple folder backup can copy wholesale. Falls back to
+        the file if keyring is unavailable, and transparently migrates an
+        existing plaintext file into keyring the first time it's found
+        (the old file is left in place untouched, not deleted, to stay
+        compatible with deny-delete hardening).
+        """
+        if KEYRING_AVAILABLE:
+            existing = self._keyring_get("recovery_key")
+            if existing:
+                return bytes.fromhex(existing)
+            if os.path.exists(self.RECOVERY_KEY_FILE):
+                with open(self.RECOVERY_KEY_FILE, "rb") as f:
+                    key = f.read()
+                self._keyring_set("recovery_key", key.hex())
+                if self._keyring_get("recovery_key_hash") is None:
+                    self._keyring_set("recovery_key_hash", hashlib.sha256(key).hexdigest())
+                return key
+            return self.create_new_recovery_key()
+
         if not os.path.exists(self.RECOVERY_KEY_FILE):
             return self.create_new_recovery_key()
         with open(self.RECOVERY_KEY_FILE, "rb") as f:
@@ -239,9 +310,12 @@ class TimeLockCore:
 
     def rotate_recovery_key(self):
         new_key = AESGCM.generate_key(bit_length=256)
-        with open(self.RECOVERY_KEY_FILE, "wb") as f:
-            f.write(new_key)
-        os.chmod(self.RECOVERY_KEY_FILE, 0o600)
+        if KEYRING_AVAILABLE:
+            self._keyring_set("recovery_key", new_key.hex())
+        else:
+            with open(self.RECOVERY_KEY_FILE, "wb") as f:
+                f.write(new_key)
+            os.chmod(self.RECOVERY_KEY_FILE, 0o600)
         self._keyring_set("recovery_key_hash", hashlib.sha256(new_key).hexdigest())
         return new_key
 
@@ -306,23 +380,39 @@ class TimeLockCore:
 
     def _atomic_write_json(self, path, data):
         """
-        WINDOWS HARDENING NOTE: this used to be temp-file-then-os.replace(),
-        which is the more crash-safe pattern in general -- but on Windows,
-        replacing an existing file requires DELETE permission on it. If
-        you apply the icacls deny-delete hardening (see
-        windows_harden.ps1), that would break the app's own legitimate
-        writes, since the app runs as the same Windows user the deny
-        applies to.
+        FIX (item 2): tries the crash-safe temp-file + os.replace()
+        pattern FIRST (a crash mid-write can never leave a half-written
+        file this way, unlike in-place truncate+rewrite). Only falls
+        back to in-place truncate+rewrite if the rename itself fails --
+        which is exactly what happens on Windows once the icacls
+        deny-delete hardening (see windows_harden.ps1) is applied, since
+        os.replace() needs DELETE permission on the destination and
+        in-place writing only needs WRITE.
 
-        So instead: if the file already exists, we write in place
-        (truncate + rewrite), which only needs WRITE access, not DELETE.
-        This stays compatible with deny-delete. The tradeoff is a
-        (very small, very unlikely) window where a hard crash or power
-        loss exactly mid-write could leave a truncated/corrupt file --
-        acceptable here since the state_hmac check will simply treat a
-        corrupt file as invalid/tampered rather than silently trusting it.
+        This means: with no hardening applied (most installs today),
+        writes are fully crash-safe. With deny-delete hardening applied,
+        it degrades gracefully to the weaker-but-still-functional
+        in-place mode automatically, instead of unconditionally taking
+        the weaker path for everyone regardless of whether it's needed.
         """
         payload = json.dumps(data, indent=4).encode()
+
+        tmp_path = f"{path}.tmp-{os.getpid()}-{secrets.token_hex(4)}"
+        try:
+            with open(tmp_path, "wb") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+            return
+        except OSError:
+            # رد شد -> احتمالاً deny-delete ACL فعاله؛ برو سراغ حالت جایگزین
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+
         if os.path.exists(path):
             with open(path, "r+b") as f:
                 f.seek(0)
@@ -340,7 +430,7 @@ class TimeLockCore:
         # LOGIC FIX: never silently clobber a lock that's still counting
         # down. Without this, calling create_new_lock while one is active
         # would quietly reset the timer -- which is itself a cheat path.
-        if os.path.exists(self.LOCK_FILE):
+        if self.has_active_lock():
             remaining, _ = self.get_remaining_time_safe()
             if remaining > 0:
                 raise RuntimeError(
@@ -546,5 +636,11 @@ class TimeLockCore:
         password = self.decrypt_password(
             dek, bytes.fromhex(data["nonce"]), bytes.fromhex(data["ciphertext"])
         )
+        # FIX (item 1): this call was missing on the normal-unlock path,
+        # so has_active_lock() kept returning True forever for a lock
+        # that had already finished normally (only Force Recovery marked
+        # it consumed). Harmless in practice because remaining still
+        # correctly computed 0, but it made has_active_lock() lie.
+        self._mark_lock_consumed()
         self._keyring_delete("active_lock_token")
         return password, "success"
