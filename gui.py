@@ -63,6 +63,13 @@ class TimeLockGUI(ctk.CTk):
         بیرون از برنامه حذف کرده تا شمارش رو ساکت کنسل کنه؛ این حالت
         دیگه بی‌صدا رد نمی‌شه.
         """
+        # FIX (fresh pass): surface keyring/security warnings loudly on
+        # startup instead of leaving them as console-only prints the user
+        # will never see.
+        warnings = self.core.get_security_warnings()
+        if warnings:
+            messagebox.showwarning("Security Warning", "\n\n".join(warnings))
+
         if self.core.check_lock_tamper_evidence():
             messagebox.showwarning(
                 "Warning",

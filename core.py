@@ -55,6 +55,17 @@ class TimeLockCore:
         self.LOCK_FILE = os.path.join(self.DATA_DIR, "lock.json")
         self.MASTER_KEY_FILE = os.path.join(self.DATA_DIR, "master.key")
         self.RECOVERY_KEY_FILE = os.path.join(self.DATA_DIR, "recovery.key")
+        # FIX (fresh pass, item A): True only once a keyring call actually
+        # raises during this session (not simply "not installed").
+        self.keyring_degraded = False
+        # FIX (fresh pass, item B): in-memory cache so that if a keyring
+        # *write* silently fails, this running process still keeps using
+        # the SAME key for the rest of its life instead of minting a new
+        # random one on every subsequent call (which would silently and
+        # unpredictably break decryption of anything wrapped earlier in
+        # this same run).
+        self._master_key_cache = None
+        self._recovery_key_cache = None
 
     @staticmethod
     def _get_data_dir():
@@ -75,24 +86,53 @@ class TimeLockCore:
             return None
         try:
             return keyring.get_password(KEYRING_SERVICE, key)
-        except Exception:
+        except Exception as e:
+            self.keyring_degraded = True
+            print(f"Warning: keyring get failed for '{key}': {e}")
             return None
 
     def _keyring_set(self, key, value):
         if not KEYRING_AVAILABLE:
-            return
+            return False
         try:
             keyring.set_password(KEYRING_SERVICE, key, value)
-        except Exception:
-            pass
+            return True
+        except Exception as e:
+            self.keyring_degraded = True
+            print(f"Warning: keyring set failed for '{key}': {e}")
+            return False
 
     def _keyring_delete(self, key):
         if not KEYRING_AVAILABLE:
             return
         try:
             keyring.delete_password(KEYRING_SERVICE, key)
-        except Exception:
-            pass
+        except Exception as e:
+            self.keyring_degraded = True
+            print(f"Warning: keyring delete failed for '{key}': {e}")
+
+    def get_security_warnings(self):
+        """
+        FIX (fresh pass, item A): fail-loud instead of fail-silent.
+        Returns human-readable warnings the GUI can surface directly,
+        instead of keyring failures being invisible to the user.
+        """
+        warnings = []
+        if not KEYRING_AVAILABLE:
+            warnings.append(
+                "The 'keyring' package is not installed. Master key, "
+                "recovery key, and tamper-history protections are all "
+                "running in their weaker file-based fallback mode.\n"
+                "Install it with: pip install keyring"
+            )
+        elif self.keyring_degraded:
+            warnings.append(
+                "keyring is installed but one or more calls to it failed "
+                "on this system during this session. Some protections may "
+                "not be working correctly -- check the console output for "
+                "details."
+            )
+        return warnings
 
     # ------------------------------------------------------------------
     # LAYER 4: escalating friction on Force Recovery
@@ -247,33 +287,58 @@ class TimeLockCore:
         the OS credential API instead of just opening a file.
         Falls back to a file (with a loud warning) only if keyring is
         unavailable.
+
+        FIX (fresh pass, item B): checks the in-memory cache first. If a
+        key was already generated this session, we NEVER mint a second
+        one for the same process, even if persisting it to keyring
+        silently failed -- that silent-failure case is exactly what used
+        to cause locks to become undecryptable with no explanation.
         """
+        if self._master_key_cache is not None:
+            return self._master_key_cache
+
         if KEYRING_AVAILABLE:
             existing = self._keyring_get("master_key")
             if existing:
-                return bytes.fromhex(existing)
+                self._master_key_cache = bytes.fromhex(existing)
+                return self._master_key_cache
             key = AESGCM.generate_key(bit_length=256)
-            self._keyring_set("master_key", key.hex())
+            if not self._keyring_set("master_key", key.hex()):
+                print(
+                    "Warning: could not persist a new master key to keyring. "
+                    "It will only be valid for this running session -- "
+                    "restarting the app before this lock finishes may make "
+                    "it unrecoverable except via Force Recovery."
+                )
+            self._master_key_cache = key
             return key
 
         if os.path.exists(self.MASTER_KEY_FILE):
             with open(self.MASTER_KEY_FILE, "rb") as f:
-                return f.read()
+                self._master_key_cache = f.read()
+                return self._master_key_cache
         key = AESGCM.generate_key(bit_length=256)
         with open(self.MASTER_KEY_FILE, "wb") as f:
             f.write(key)
         os.chmod(self.MASTER_KEY_FILE, 0o600)
+        self._master_key_cache = key
         return key
 
     def create_new_recovery_key(self):
         key = AESGCM.generate_key(bit_length=256)
         if KEYRING_AVAILABLE:
-            self._keyring_set("recovery_key", key.hex())
+            if not self._keyring_set("recovery_key", key.hex()):
+                print(
+                    "Warning: could not persist the new recovery key to "
+                    "keyring. It will only be valid for this running "
+                    "session."
+                )
         else:
             with open(self.RECOVERY_KEY_FILE, "wb") as f:
                 f.write(key)
             os.chmod(self.RECOVERY_KEY_FILE, 0o600)
         self._keyring_set("recovery_key_hash", hashlib.sha256(key).hexdigest())
+        self._recovery_key_cache = key
         return key
 
     def get_recovery_key(self):
@@ -286,17 +351,27 @@ class TimeLockCore:
         existing plaintext file into keyring the first time it's found
         (the old file is left in place untouched, not deleted, to stay
         compatible with deny-delete hardening).
+
+        FIX (fresh pass, item B): checks the in-memory cache first, for
+        the same reason as load_master_key -- a silently-failed keyring
+        write must never cause this process to mint a second, different
+        recovery key later in the same run.
         """
+        if self._recovery_key_cache is not None:
+            return self._recovery_key_cache
+
         if KEYRING_AVAILABLE:
             existing = self._keyring_get("recovery_key")
             if existing:
-                return bytes.fromhex(existing)
+                self._recovery_key_cache = bytes.fromhex(existing)
+                return self._recovery_key_cache
             if os.path.exists(self.RECOVERY_KEY_FILE):
                 with open(self.RECOVERY_KEY_FILE, "rb") as f:
                     key = f.read()
                 self._keyring_set("recovery_key", key.hex())
                 if self._keyring_get("recovery_key_hash") is None:
                     self._keyring_set("recovery_key_hash", hashlib.sha256(key).hexdigest())
+                self._recovery_key_cache = key
                 return key
             return self.create_new_recovery_key()
 
@@ -306,17 +381,24 @@ class TimeLockCore:
             key = f.read()
         if self._keyring_get("recovery_key_hash") is None:
             self._keyring_set("recovery_key_hash", hashlib.sha256(key).hexdigest())
+        self._recovery_key_cache = key
         return key
 
     def rotate_recovery_key(self):
         new_key = AESGCM.generate_key(bit_length=256)
         if KEYRING_AVAILABLE:
-            self._keyring_set("recovery_key", new_key.hex())
+            if not self._keyring_set("recovery_key", new_key.hex()):
+                print(
+                    "Warning: could not persist the rotated recovery key "
+                    "to keyring. It will only be valid for this running "
+                    "session."
+                )
         else:
             with open(self.RECOVERY_KEY_FILE, "wb") as f:
                 f.write(new_key)
             os.chmod(self.RECOVERY_KEY_FILE, 0o600)
         self._keyring_set("recovery_key_hash", hashlib.sha256(new_key).hexdigest())
+        self._recovery_key_cache = new_key
         return new_key
 
     def load_state(self):
@@ -327,8 +409,11 @@ class TimeLockCore:
         return state
 
     def save_state(self, state):
-        with open(self.STATE_FILE, "w") as f:
-            json.dump(state, f, indent=4)
+        # FIX (fresh pass, item D): was a plain non-atomic write before --
+        # inconsistent with lock.json's crash-safe handling, and this file
+        # now also holds the recovery-history fallback + its signature
+        # when keyring is unavailable.
+        self._atomic_write_json(self.STATE_FILE, state)
 
     def safe_time(self, state):
         now = time.time()
@@ -579,12 +664,36 @@ class TimeLockCore:
         master_key = self.load_master_key()
         state = self.load_state()
 
-        with open(self.LOCK_FILE) as f:
-            data = json.load(f)
+        # FIX (fresh pass, item C): get_remaining_time_safe() already
+        # treats a corrupt lock.json as tampered instead of crashing, but
+        # this direct read here didn't have the same protection -- a
+        # corrupted file would raise an uncaught JSONDecodeError and
+        # crash the whole app instead of failing gracefully.
+        try:
+            with open(self.LOCK_FILE) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return None, "Lock file is corrupted or unreadable - use Force Recovery"
 
         if force_recovery and recovery_key_input:
             try:
                 recovery_key = bytes.fromhex(recovery_key_input)
+            except Exception:
+                return None, "Invalid recovery key"
+
+            # FIX (fresh pass, item E): check the key against the known-
+            # current hash BEFORE doing any decryption work, not after.
+            # Rejecting early means a stale/replayed key never gets its
+            # bytes unwrapped or decrypted at all, which is both cleaner
+            # and slightly more defensive than decrypting first and only
+            # then deciding to discard the result.
+            expected_hash = self._keyring_get("recovery_key_hash")
+            if expected_hash is not None:
+                actual_hash = hashlib.sha256(recovery_key).hexdigest()
+                if actual_hash != expected_hash:
+                    return None, "This recovery key has already been used and rotated"
+
+            try:
                 dek = self.unwrap_key(
                     recovery_key,
                     bytes.fromhex(data["recovery_nonce"]),
@@ -595,12 +704,6 @@ class TimeLockCore:
                 )
             except Exception:
                 return None, "Invalid recovery key"
-
-            expected_hash = self._keyring_get("recovery_key_hash")
-            if expected_hash is not None:
-                actual_hash = hashlib.sha256(recovery_key).hexdigest()
-                if actual_hash != expected_hash:
-                    return None, "This recovery key has already been used and rotated"
 
             if os.path.exists(self.LOCK_FILE):
                 self._mark_lock_consumed()
