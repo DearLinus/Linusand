@@ -83,7 +83,3 @@ Ideas under consideration, roughly in order of how much they'd change the threat
 - **Mobile companion app** — since the whole point is keeping the phone locked, a native mobile component (rather than a desktop app the user sets the phone's password from) could tie more directly into the phone's own lock mechanism.
 - **Telegram bot integration** — for remote status/notifications ("your lock ends in 10 minutes"), or as a lightweight remote-trigger/companion interface without needing a full mobile app.
 - **GUI library migration** — CustomTkinter is fine for a single-user desktop tool, but if this grows toward a real product, worth evaluating PySide6/Qt (richer desktop widgets, cross-platform polish) or a web-based frontend (Flask/FastAPI backend + a proper frontend framework) if a server component happens anyway.
-
-## License
-
-*(decide before making the repo public -- see project notes)*
