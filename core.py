@@ -84,7 +84,7 @@ class TimeLockCore:
         """
         now = time.time()
         if now < state.get("last_seen", 0) - CLOCK_TAMPER_THRESHOLD:
-            print("⚠️  هشدار: زمان سیستم دستکاری شده!")
+            print("⚠️  Warning: system clock appears to have been tampered with!")
             return None
         state["last_seen"] = now
         self.save_state(state)
@@ -237,7 +237,7 @@ class TimeLockCore:
         ساعت) استفاده می‌کنه.
         """
         if not os.path.exists(self.LOCK_FILE):
-            return None, "لاک فعالی وجود ندارد"
+            return None, "No active lock"
 
         master_key = self.load_master_key()
         state = self.load_state()
@@ -257,7 +257,7 @@ class TimeLockCore:
                     dek, bytes.fromhex(data["nonce"]), bytes.fromhex(data["ciphertext"])
                 )
             except Exception:
-                return None, "Recovery Key اشتباه است"
+                return None, "Invalid recovery key"
 
             # این کلید recovery همین الان مصرف شد. طبق مکانیزم مورد نظر:
             # ۱) قفل فعلی دیگه لازم نیست شمارشش ادامه پیدا کنه، چون رمز
@@ -280,7 +280,7 @@ class TimeLockCore:
         # تشخیص عقب رفتن ساعت (feature قبلی، دست‌نخورده)
         now = self.safe_time(state)
         if now is None:
-            return None, "هشدار: ساعت سیستم به عقب برگردانده شده است"
+            return None, "Warning: system clock was rolled back"
 
         # تشخیص جلو رفتن ساعت + تصمیم فاز قفل (temp vs master)
         remaining, tampered = self.get_remaining_time_safe()
@@ -296,7 +296,7 @@ class TimeLockCore:
                     master_key, bytes.fromhex(data["master_nonce"]), bytes.fromhex(data["master_wrapped"])
                 )
         except Exception:
-            return None, "خطا در رمزگشایی کلید"
+            return None, "Key decryption failed"
 
         password = self.decrypt_password(
             dek, bytes.fromhex(data["nonce"]), bytes.fromhex(data["ciphertext"])

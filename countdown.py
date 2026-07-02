@@ -57,7 +57,7 @@ class CountdownManager:
 
         if self.tamper_label is not None:
             if tampered:
-                self.tamper_label.configure(text="⚠ دستکاری ساعت سیستم شناسایی شد")
+                self.tamper_label.configure(text="⚠ System clock tampering detected")
             else:
                 self.tamper_label.configure(text="")
 

@@ -79,9 +79,6 @@ class TimeLockGUI(ctk.CTk):
         ctk.CTkButton(self, text="Start New Lock", font=ctk.CTkFont(size=16), height=50,
                      command=self.start_new_lock).pack(pady=30)
 
-        ctk.CTkButton(self, text="Force Recovery", fg_color="red",
-                     command=self.show_recovery_input).pack(pady=10)
-
         ctk.CTkButton(self, text="Generate New Recovery Key", fg_color="orange",
                      command=self.generate_new_recovery).pack(pady=10)
 
@@ -128,8 +125,7 @@ class TimeLockGUI(ctk.CTk):
         ctk.CTkButton(self, text="I have set it on my phone - Start Countdown", fg_color="green",
                      command=self.start_countdown).pack(pady=20)
 
-        ctk.CTkButton(self, text="Force Recovery", fg_color="red",
-                     command=self.show_recovery_input).pack(pady=10)
+        ctk.CTkButton(self, text="Back", command=self.create_home_screen).pack(pady=10)
 
     def copy_password(self):
         self.clipboard_clear()
@@ -168,7 +164,7 @@ class TimeLockGUI(ctk.CTk):
         if password is None:
             password, status = self.core.unlock_password()
             if not password:
-                messagebox.showerror("خطا", status)
+                messagebox.showerror("Error", status)
                 self.create_home_screen()
                 return
 
@@ -238,9 +234,8 @@ class TimeLockGUI(ctk.CTk):
         if state.get("recovery_shown", False):
             messagebox.showinfo(
                 "Info",
-                "Recovery Key قبلاً نمایش داده شده و هنوز معتبره.\n"
-                "بعد از این‌که در یک شرایط اضطراری استفاده بشه، دفعه‌ی بعد "
-                "می‌تونید کلید تازه رو با همین دکمه ببینید."
+                "This recovery key is still valid.\n"
+                "A new one will appear here after it's used."
             )
             return
 
