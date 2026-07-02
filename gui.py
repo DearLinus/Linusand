@@ -5,11 +5,33 @@ from tkinter import messagebox
 import time
 import json
 import os
+import socket
+import sys
 from core import TimeLockCore
+import core
 from countdown import CountdownManager
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
+
+# Single-instance guard: binding a fixed localhost port fails if another
+# copy already holds it. This matters once the Windows hardening script
+# registers a Scheduled Task that tries to relaunch the app every minute
+# (in case it was closed) -- without this, every check would pile up a
+# new duplicate window instead of just leaving the existing one alone.
+# The socket is intentionally never closed for the life of the process;
+# the OS releases it automatically when the process exits.
+_SINGLE_INSTANCE_PORT = 47285
+
+
+def _acquire_single_instance_lock():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", _SINGLE_INSTANCE_PORT))
+        sock.listen(1)
+        return sock
+    except OSError:
+        return None
 
 
 class TimeLockGUI(ctk.CTk):
@@ -49,7 +71,7 @@ class TimeLockGUI(ctk.CTk):
             )
             self.core.clear_lock_tamper_evidence()
 
-        if os.path.exists(self.core.LOCK_FILE):
+        if self.core.has_active_lock():
             remaining, _tampered = self.core.get_remaining_time_safe()
             if remaining > 0:
                 self.countdown_started = True
@@ -72,6 +94,7 @@ class TimeLockGUI(ctk.CTk):
         ctk.CTkLabel(self, text="Select lock duration:", font=ctk.CTkFont(size=18)).pack(pady=10)
 
         self.time_var = tk.StringVar(value="")
+        self._last_radio_value = ""
 
         options = [
             ("30 minutes", "30"),
@@ -81,7 +104,10 @@ class TimeLockGUI(ctk.CTk):
         ]
 
         for text, minutes in options:
-            ctk.CTkRadioButton(self, text=text, variable=self.time_var, value=minutes).pack(pady=8)
+            ctk.CTkRadioButton(
+                self, text=text, variable=self.time_var, value=minutes,
+                command=lambda v=minutes: self._on_time_radio_click(v),
+            ).pack(pady=8)
 
         custom_frame = ctk.CTkFrame(self)
         custom_frame.pack(pady=15)
@@ -94,6 +120,20 @@ class TimeLockGUI(ctk.CTk):
 
         ctk.CTkButton(self, text="Generate New Recovery Key", fg_color="orange",
                      command=self.generate_new_recovery).pack(pady=10)
+
+    def _on_time_radio_click(self, value):
+        """
+        CTkRadioButton's default behavior is a standard radio group: it
+        already re-selects itself on a repeat click, it never deselects.
+        Clicking whichever option was already chosen now clears the
+        selection instead, so it behaves the way the user expects a
+        toggle to behave.
+        """
+        if self._last_radio_value == value:
+            self.time_var.set("")
+            self._last_radio_value = ""
+        else:
+            self._last_radio_value = value
 
     def start_new_lock(self):
         """
@@ -132,7 +172,14 @@ class TimeLockGUI(ctk.CTk):
         self.pass_label = ctk.CTkLabel(frame, text=self.current_password, font=ctk.CTkFont(size=24, weight="bold"))
         self.pass_label.pack(pady=30)
 
-        ctk.CTkButton(self, text="Copy Password", command=self.copy_password).pack(pady=10)
+        # Deliberately no "Copy Password" button here. If you can copy
+        # it to the clipboard now, it can end up in clipboard history,
+        # a notes app, etc. -- exactly what typing it into your phone by
+        # hand and then relying on the lock is supposed to prevent.
+        ctk.CTkLabel(
+            self, text="Type this into your phone's lock screen now.",
+            font=ctk.CTkFont(size=13), text_color="gray70",
+        ).pack(pady=(0, 10))
 
         # فقط این دکمه شمارش رو شروع می‌کنه
         ctk.CTkButton(self, text="I have set it on my phone - Start Countdown", fg_color="green",
@@ -196,6 +243,134 @@ class TimeLockGUI(ctk.CTk):
         ctk.CTkButton(self, text="Back to Home", command=self.create_home_screen).pack(pady=10)
 
     def show_recovery_input(self):
+        """
+        LAYER 4: Force Recovery is no longer a single dialog. It now goes
+        through a gate first:
+          1. If still in cooldown (grows with each past use, capped at
+             8h), show the countdown and refuse to proceed at all.
+          2. Otherwise, show the history of past early-unlocks plus a
+             short acknowledgment phrase the user must type out by hand
+             (not paste) N times, where N grows with past use count.
+          3. Only then does the actual recovery-key entry form appear.
+        None of this stops a determined person -- it's designed to add a
+        real, deliberate pause and a moment of "do I actually want to do
+        this" before the key form is even reachable.
+        """
+        remaining, required_acks, history = self.core.get_recovery_cooldown_status()
+
+        if remaining > 0:
+            self._show_recovery_cooldown_screen(remaining, history)
+        else:
+            self._show_recovery_acknowledgment_screen(required_acks, history)
+
+    def _show_recovery_cooldown_screen(self, remaining, history):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Force Recovery - On Cooldown")
+        dialog.geometry("520x320")
+        dialog.attributes('-topmost', True)
+
+        ctk.CTkLabel(
+            dialog, text="Force Recovery isn't available yet",
+            font=ctk.CTkFont(size=18, weight="bold")
+        ).pack(pady=(20, 10))
+
+        mins, secs = divmod(int(remaining), 60)
+        hrs, mins = divmod(mins, 60)
+        time_str = f"{hrs}h {mins:02d}m {secs:02d}s" if hrs else f"{mins}m {secs:02d}s"
+
+        ctk.CTkLabel(
+            dialog,
+            text=f"Available again in: {time_str}",
+            font=ctk.CTkFont(size=16),
+            text_color="orange",
+        ).pack(pady=10)
+
+        ctk.CTkLabel(
+            dialog,
+            text=f"You've used early recovery {len(history)} time(s) before.\n"
+                 "Each use makes the next wait longer.",
+            font=ctk.CTkFont(size=13),
+            justify="center",
+        ).pack(pady=15)
+
+        ctk.CTkButton(dialog, text="Close", command=dialog.destroy).pack(pady=15)
+
+    def _show_recovery_acknowledgment_screen(self, required_acks, history):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Force Recovery")
+        dialog.geometry("620x480")
+        dialog.attributes('-topmost', True)
+
+        ctk.CTkLabel(
+            dialog, text="Before you continue",
+            font=ctk.CTkFont(size=20, weight="bold")
+        ).pack(pady=(20, 5))
+
+        if history:
+            recent = history[-3:]
+            lines = [
+                time.strftime("%b %d, %H:%M", time.localtime(h["ts"]))
+                for h in recent
+            ]
+            hist_text = "Previous early unlocks: " + ", ".join(lines)
+            ctk.CTkLabel(
+                dialog, text=hist_text, font=ctk.CTkFont(size=12),
+                text_color="gray70", justify="center", wraplength=560,
+            ).pack(pady=(0, 10))
+
+        phrase = core.RECOVERY_ACK_PHRASE_TEMPLATE
+        ctk.CTkLabel(
+            dialog,
+            text=f'Type the following phrase exactly, {required_acks} time'
+                 f'{"s" if required_acks != 1 else ""} in a row, to continue:',
+            font=ctk.CTkFont(size=14),
+            wraplength=560, justify="center",
+        ).pack(pady=(5, 5))
+
+        ctk.CTkLabel(
+            dialog, text=f'"{phrase}"',
+            font=ctk.CTkFont(size=14, weight="bold", slant="italic"),
+            wraplength=560, justify="center",
+        ).pack(pady=(0, 15))
+
+        progress_label = ctk.CTkLabel(dialog, text=f"0 / {required_acks}", font=ctk.CTkFont(size=13))
+        progress_label.pack(pady=(0, 5))
+
+        ack_entry = ctk.CTkEntry(dialog, width=560, height=36)
+        ack_entry.pack(pady=5, padx=20)
+
+        # The whole point of this field is that it must be typed by hand,
+        # not pasted -- block every paste path (virtual event, Ctrl+V,
+        # middle-click on Linux/X11).
+        def _block_paste(event=None):
+            return "break"
+
+        ack_entry.bind("<<Paste>>", _block_paste)
+        ack_entry.bind("<Control-v>", _block_paste)
+        ack_entry.bind("<Control-V>", _block_paste)
+        ack_entry.bind("<Button-2>", _block_paste)
+
+        state = {"count": 0}
+
+        def check_ack(event=None):
+            typed = ack_entry.get().strip()
+            ack_entry.delete(0, "end")
+            if typed == phrase:
+                state["count"] += 1
+                progress_label.configure(text=f"{state['count']} / {required_acks}")
+                if state["count"] >= required_acks:
+                    dialog.destroy()
+                    self._show_recovery_key_form()
+            else:
+                state["count"] = 0
+                progress_label.configure(text=f"0 / {required_acks} (didn't match, try again)")
+
+        ack_entry.bind("<Return>", check_ack)
+        ack_entry.focus()
+
+        ctk.CTkButton(dialog, text="Cancel", fg_color="gray40", command=dialog.destroy).pack(pady=20)
+
+    def _show_recovery_key_form(self):
         dialog = ctk.CTkToplevel(self)
         dialog.title("Force Recovery")
         dialog.geometry("600x250")
@@ -213,16 +388,14 @@ class TimeLockGUI(ctk.CTk):
             if recovery_input:
                 password, status = self.core.unlock_password(force_recovery=True, recovery_key_input=recovery_input)
                 if password:
-                    # FIX: شمارش رو همین‌جا، قبل از هر رویداد دیگه‌ای (مثل
-                    # messagebox یا برگشت به mainloop) متوقف می‌کنیم. اگه
-                    # این تیک از شمارش که قبلاً زمان‌بندی شده اجازه پیدا
-                    # کنه اجرا بشه، چون lock.json دیگه وجود نداره، یه
-                    # پنجره‌ی خطای اضافه‌ی «لاک فعالی وجود ندارد» باز می‌کرد.
+                    # Stop the countdown immediately, before anything else
+                    # (like this messagebox or the next mainloop tick) can
+                    # run -- otherwise an already-scheduled countdown tick
+                    # could fire against a lock file that no longer
+                    # represents an active lock and throw a spurious error.
                     self.countdown_manager.stop()
                     self.countdown_started = False
                     self.pending_duration = None
-                    # به‌جای پاپ‌آپ، مستقیم می‌ریم به صفحه‌ی نهایی نمایش رمز
-                    # (همون صفحه‌ای که در پایان عادی شمارش هم نشون داده می‌شه)
                     self.show_final_unlock(password=password)
                 else:
                     messagebox.showerror("Error", status)
@@ -283,5 +456,12 @@ class TimeLockGUI(ctk.CTk):
 
 
 if __name__ == "__main__":
+    _lock_socket = _acquire_single_instance_lock()
+    if _lock_socket is None:
+        # Another instance is already running -- just exit. This is the
+        # normal, expected outcome when the Scheduled Task's periodic
+        # relaunch check fires while the app is already open.
+        sys.exit(0)
+
     app = TimeLockGUI()
     app.mainloop()
