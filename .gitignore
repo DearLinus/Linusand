@@ -1,0 +1,6 @@
+*.key
+state.json
+lock.json
+temp.txt
+__pycache__/
+*.pyc
