@@ -35,7 +35,20 @@ class TimeLockGUI(ctk.CTk):
         """
         FIX (مشکل ۴): وضعیت رو از روی فایل‌های روی دیسک (lock.json) بازیابی
         می‌کنه، نه از متغیرهای حافظه‌ای که با بستن برنامه از بین می‌رن.
+
+        FIX (مشکل ۶): اگه keyring نشون بده باید یک لاک فعال وجود داشته
+        باشه ولی lock.json پیدا نشه، یعنی احتمالاً کسی فایل رو مستقیم و
+        بیرون از برنامه حذف کرده تا شمارش رو ساکت کنسل کنه؛ این حالت
+        دیگه بی‌صدا رد نمی‌شه.
         """
+        if self.core.check_lock_tamper_evidence():
+            messagebox.showwarning(
+                "Warning",
+                "A previous lock appears to have been deleted manually "
+                "(outside the app) before it finished."
+            )
+            self.core.clear_lock_tamper_evidence()
+
         if os.path.exists(self.core.LOCK_FILE):
             remaining, _tampered = self.core.get_remaining_time_safe()
             if remaining > 0:

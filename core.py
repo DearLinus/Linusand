@@ -2,13 +2,24 @@
 import os
 import json
 import time
+import hmac
+import hashlib
 import secrets
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from datetime import datetime
 
-# حداکثر اختلاف مجاز (به ثانیه) بین wall-clock و monotonic clock
-# قبل از این‌که دستکاری ساعت سیستم تشخیص داده بشه
 CLOCK_TAMPER_THRESHOLD = 15
+TAMPER_LOCKOUT_SECONDS = 10**9
+KEYRING_SERVICE = "TimeLockApp"
+
+try:
+    import keyring
+    KEYRING_AVAILABLE = True
+except ImportError:
+    KEYRING_AVAILABLE = False
+    print(
+        "Warning: keyring not available (pip install keyring). "
+        "Backup/restore tamper protection is disabled."
+    )
 
 
 class TimeLockCore:
@@ -17,6 +28,30 @@ class TimeLockCore:
         self.LOCK_FILE = "lock.json"
         self.MASTER_KEY_FILE = "master.key"
         self.RECOVERY_KEY_FILE = "recovery.key"
+
+    def _keyring_get(self, key):
+        if not KEYRING_AVAILABLE:
+            return None
+        try:
+            return keyring.get_password(KEYRING_SERVICE, key)
+        except Exception:
+            return None
+
+    def _keyring_set(self, key, value):
+        if not KEYRING_AVAILABLE:
+            return
+        try:
+            keyring.set_password(KEYRING_SERVICE, key, value)
+        except Exception:
+            pass
+
+    def _keyring_delete(self, key):
+        if not KEYRING_AVAILABLE:
+            return
+        try:
+            keyring.delete_password(KEYRING_SERVICE, key)
+        except Exception:
+            pass
 
     def generate_strong_password(self, length=18):
         alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+-=[]{}|;:,.<>?"
@@ -33,43 +68,35 @@ class TimeLockCore:
         return key
 
     def create_new_recovery_key(self):
-        """
-        ساخت اولین recovery key، فقط وقتی که فایل recovery.key اصلاً
-        وجود نداره (اولین اجرای برنامه). برای rotate کردن کلید بعد از
-        مصرف، از rotate_recovery_key() استفاده می‌شه.
-        """
         key = AESGCM.generate_key(bit_length=256)
         with open(self.RECOVERY_KEY_FILE, "wb") as f:
             f.write(key)
         os.chmod(self.RECOVERY_KEY_FILE, 0o600)
+        self._keyring_set("recovery_key_hash", hashlib.sha256(key).hexdigest())
         return key
 
     def get_recovery_key(self):
         if not os.path.exists(self.RECOVERY_KEY_FILE):
             return self.create_new_recovery_key()
         with open(self.RECOVERY_KEY_FILE, "rb") as f:
-            return f.read()
+            key = f.read()
+        if self._keyring_get("recovery_key_hash") is None:
+            self._keyring_set("recovery_key_hash", hashlib.sha256(key).hexdigest())
+        return key
 
     def rotate_recovery_key(self):
-        """
-        یک recovery key کاملاً جدید می‌سازه و جایگزین قدیمی می‌کنه.
-        این تابع بعد از مصرف موفق یک recovery key (در unlock_password با
-        force_recovery=True) صدا زده می‌شه تا کلید قدیمی دیگه برای هیچ
-        قفلی (نه قفل فعلی که حذف شده، نه قفل‌های بعدی) معتبر نباشه.
-        """
         new_key = AESGCM.generate_key(bit_length=256)
         with open(self.RECOVERY_KEY_FILE, "wb") as f:
             f.write(new_key)
         os.chmod(self.RECOVERY_KEY_FILE, 0o600)
+        self._keyring_set("recovery_key_hash", hashlib.sha256(new_key).hexdigest())
         return new_key
 
     def load_state(self):
         if not os.path.exists(self.STATE_FILE):
-            return {"last_seen": time.time(), "temp_version": 0, "active_temp_key": None}
+            return {"last_seen": time.time()}
         with open(self.STATE_FILE, "r") as f:
             state = json.load(f)
-        state.setdefault("temp_version", 0)
-        state.setdefault("active_temp_key", None)
         return state
 
     def save_state(self, state):
@@ -77,14 +104,9 @@ class TimeLockCore:
             json.dump(state, f, indent=4)
 
     def safe_time(self, state):
-        """
-        تشخیص عقب رفتن ساعت سیستم (backward tampering).
-        این تابع دست‌نخورده مونده، فقط کنارش get_remaining_time_safe
-        برای تشخیص جلو رفتن ساعت اضافه شده.
-        """
         now = time.time()
         if now < state.get("last_seen", 0) - CLOCK_TAMPER_THRESHOLD:
-            print("⚠️  Warning: system clock appears to have been tampered with!")
+            print("Warning: system clock appears to have been tampered with!")
             return None
         state["last_seen"] = now
         self.save_state(state)
@@ -109,24 +131,13 @@ class TimeLockCore:
         aes = AESGCM(wrapping_key)
         return aes.decrypt(nonce, wrapped, None)
 
-    def create_new_lock(self, duration_seconds: int, password: str = None):
-        """
-        FIX (مشکل شمارش زودهنگام): پارامتر اختیاری password اضافه شد تا
-        بشه رمزی که از قبل تولید و به کاربر نمایش داده شده رو دوباره‌استفاده
-        کرد، به‌جای تولید یک رمز تصادفی جدید.
+    def _timing_hmac(self, master_key, duration_seconds, created_wall, created_mono):
+        msg = f"{duration_seconds}|{created_wall}|{created_mono}".encode()
+        return hmac.new(master_key, msg, hashlib.sha256).hexdigest()
 
-        FIX (مشکل ۲): علاوه بر unlock_time (wall-clock)، duration_seconds
-        و created_mono (ساعت monotonic) هم ذخیره می‌شن تا بعداً بشه دستکاری
-        ساعت سیستم رو تشخیص داد.
-        """
+    def create_new_lock(self, duration_seconds: int, password: str = None):
         master_key = self.load_master_key()
         recovery_key = self.get_recovery_key()
-        state = self.load_state()
-
-        state["temp_version"] = state.get("temp_version", 0) + 1
-        temp_key = AESGCM.generate_key(bit_length=256)
-        state["active_temp_key"] = temp_key.hex()
-        self.save_state(state)
 
         if password is None:
             password = self.generate_strong_password()
@@ -138,20 +149,24 @@ class TimeLockCore:
 
         nonce, ciphertext = self.encrypt_password(dek, password)
         m_nonce, m_wrapped = self.wrap_key(master_key, dek)
-        t_nonce, t_wrapped = self.wrap_key(temp_key, dek)
         r_nonce, r_wrapped = self.wrap_key(recovery_key, dek)
+
+        lock_token = secrets.token_hex(16)
 
         lock_data = {
             "unlock_time": unlock_time,
             "duration_seconds": duration_seconds,
             "created_wall": created_wall,
             "created_mono": created_mono,
+            "checkpoint_wall": created_wall,
+            "checkpoint_mono": created_mono,
+            "trusted_elapsed": 0.0,
+            "timing_hmac": self._timing_hmac(master_key, duration_seconds, created_wall, created_mono),
+            "lock_token": lock_token,
             "nonce": nonce.hex(),
             "ciphertext": ciphertext.hex(),
             "master_nonce": m_nonce.hex(),
             "master_wrapped": m_wrapped.hex(),
-            "temp_nonce": t_nonce.hex(),
-            "temp_wrapped": t_wrapped.hex(),
             "recovery_nonce": r_nonce.hex(),
             "recovery_wrapped": r_wrapped.hex(),
         }
@@ -159,23 +174,11 @@ class TimeLockCore:
         with open(self.LOCK_FILE, "w") as f:
             json.dump(lock_data, f, indent=4)
 
+        self._keyring_set("active_lock_token", lock_token)
+
         return password, unlock_time
 
     def get_remaining_time_safe(self):
-        """
-        FIX (مشکل ۲): محاسبه‌ی زمان باقی‌مانده با مقاومت در برابر دستکاری
-        ساعت سیستم (system clock).
-
-        از دو ساعت استفاده می‌کنه:
-        - wall-clock (time.time): قابل تغییر توسط کاربر از تنظیمات سیستم
-        - monotonic clock (time.monotonic): همیشه فقط جلو می‌ره و از تغییر
-          ساعت سیستم اثر نمی‌گیره (فقط با ری‌استارت کامل سیستم ریست می‌شه)
-
-        اگه اختلاف بین این دو زیاد بشه، یعنی ساعت سیستم دستکاری شده؛
-        در این حالت مبنا رو ساعت monotonic قرار می‌دیم (قابل اعتمادتره).
-
-        خروجی: (remaining_seconds, tampered_bool)
-        """
         if not os.path.exists(self.LOCK_FILE):
             return 0, False
 
@@ -189,27 +192,46 @@ class TimeLockCore:
         now_wall = time.time()
         now_mono = time.monotonic()
 
-        # سازگاری با قفل‌های قدیمی که این فیلدهای جدید رو ندارن
         if duration is None or created_wall is None:
             remaining = max(0, data.get("unlock_time", now_wall) - now_wall)
             return remaining, False
 
-        elapsed_wall = now_wall - created_wall
+        if "timing_hmac" in data:
+            master_key = self.load_master_key()
+            expected = self._timing_hmac(master_key, duration, created_wall, created_mono)
+            if data["timing_hmac"] != expected:
+                return TAMPER_LOCKOUT_SECONDS, True
+
+        checkpoint_wall = data.get("checkpoint_wall", created_wall)
+        checkpoint_mono = data.get("checkpoint_mono", created_mono)
+        trusted_elapsed = data.get("trusted_elapsed", 0.0)
+
         tampered = False
 
-        if created_mono is not None and now_mono >= created_mono:
-            elapsed_mono = now_mono - created_mono
-            if abs(elapsed_wall - elapsed_mono) > CLOCK_TAMPER_THRESHOLD:
+        if checkpoint_mono is not None and now_mono >= checkpoint_mono:
+            delta_wall = now_wall - checkpoint_wall
+            delta_mono = now_mono - checkpoint_mono
+            if abs(delta_wall - delta_mono) > CLOCK_TAMPER_THRESHOLD:
                 tampered = True
-                elapsed = elapsed_mono
+                delta = delta_mono
             else:
-                elapsed = elapsed_wall
+                delta = delta_wall
         else:
-            # سیستم ری‌استارت شده و مقدار monotonic ریست شده؛
-            # امکان مقایسه نیست، مجبوریم به wall-clock اعتماد کنیم
-            elapsed = elapsed_wall
+            tampered = True
+            delta = max(0, now_wall - checkpoint_wall)
 
-        remaining = max(0, duration - elapsed)
+        total_elapsed = min(trusted_elapsed + max(0, delta), duration)
+        remaining = max(0, duration - total_elapsed)
+
+        data["checkpoint_wall"] = now_wall
+        data["checkpoint_mono"] = now_mono
+        data["trusted_elapsed"] = total_elapsed
+        try:
+            with open(self.LOCK_FILE, "w") as f:
+                json.dump(data, f, indent=4)
+        except Exception:
+            pass
+
         return remaining, tampered
 
     def get_remaining_time(self):
@@ -219,23 +241,14 @@ class TimeLockCore:
     def is_time_up(self):
         return self.get_remaining_time() <= 0
 
-    def get_password(self):
-        if not os.path.exists(self.LOCK_FILE):
-            return None
-        with open(self.LOCK_FILE) as f:
-            data = json.load(f)
-        return data.get("password")
+    def check_lock_tamper_evidence(self):
+        token = self._keyring_get("active_lock_token")
+        return bool(token) and not os.path.exists(self.LOCK_FILE)
+
+    def clear_lock_tamper_evidence(self):
+        self._keyring_delete("active_lock_token")
 
     def unlock_password(self, force_recovery=False, recovery_key_input=None):
-        """
-        FIX (مشکل ۱): این تابع حالا در مسیر عادی برنامه (پایان شمارش) هم
-        صدا زده می‌شه، نه فقط در مسیر Force Recovery. یعنی رمز واقعاً از
-        روی فایل رمزگشایی می‌شه، نه اینکه از متغیر حافظه‌ی GUI خونده بشه.
-
-        FIX (مشکل ۲): تصمیم‌گیری «هنوز قفله یا نه» به‌جای وابستگی مستقیم
-        به wall-clock، از get_remaining_time_safe (مقاوم در برابر دستکاری
-        ساعت) استفاده می‌کنه.
-        """
         if not os.path.exists(self.LOCK_FILE):
             return None, "No active lock"
 
@@ -259,16 +272,15 @@ class TimeLockCore:
             except Exception:
                 return None, "Invalid recovery key"
 
-            # این کلید recovery همین الان مصرف شد. طبق مکانیزم مورد نظر:
-            # ۱) قفل فعلی دیگه لازم نیست شمارشش ادامه پیدا کنه، چون رمز
-            #    از طریق ریکاوری همین الان لو رفته.
-            # ۲) کلید recovery بلافاصله rotate می‌شه تا همین کلید قدیمی
-            #    نتونه برای قفل بعدی هم استفاده بشه.
-            # ۳) flag نمایش ریست می‌شه تا دفعه‌ی بعد که کاربر روی
-            #    "Generate New Recovery Key" کلیک کنه، همین کلید تازه‌ی
-            #    rotate‌شده بهش نشون داده بشه.
+            expected_hash = self._keyring_get("recovery_key_hash")
+            if expected_hash is not None:
+                actual_hash = hashlib.sha256(recovery_key).hexdigest()
+                if actual_hash != expected_hash:
+                    return None, "This recovery key has already been used and rotated"
+
             if os.path.exists(self.LOCK_FILE):
                 os.remove(self.LOCK_FILE)
+            self._keyring_delete("active_lock_token")
 
             self.rotate_recovery_key()
 
@@ -277,28 +289,27 @@ class TimeLockCore:
 
             return password, "success"
 
-        # تشخیص عقب رفتن ساعت (feature قبلی، دست‌نخورده)
         now = self.safe_time(state)
         if now is None:
             return None, "Warning: system clock was rolled back"
 
-        # تشخیص جلو رفتن ساعت + تصمیم فاز قفل (temp vs master)
         remaining, tampered = self.get_remaining_time_safe()
 
+        if remaining > 0:
+            msg = "Lock is still active"
+            if tampered:
+                msg += " (clock/file tampering detected - use Force Recovery instead)"
+            return None, msg
+
         try:
-            if remaining > 0:
-                temp_key = bytes.fromhex(state["active_temp_key"])
-                dek = self.unwrap_key(
-                    temp_key, bytes.fromhex(data["temp_nonce"]), bytes.fromhex(data["temp_wrapped"])
-                )
-            else:
-                dek = self.unwrap_key(
-                    master_key, bytes.fromhex(data["master_nonce"]), bytes.fromhex(data["master_wrapped"])
-                )
+            dek = self.unwrap_key(
+                master_key, bytes.fromhex(data["master_nonce"]), bytes.fromhex(data["master_wrapped"])
+            )
         except Exception:
             return None, "Key decryption failed"
 
         password = self.decrypt_password(
             dek, bytes.fromhex(data["nonce"]), bytes.fromhex(data["ciphertext"])
         )
+        self._keyring_delete("active_lock_token")
         return password, "success"
